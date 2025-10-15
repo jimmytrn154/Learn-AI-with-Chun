@@ -1,0 +1,9 @@
+id,name,due_at,points_possible,course_id
+39231,Introduction to Data Science Programming,2025-09-15T16:59:59Z,10.0,2819
+39232,The Data Science Lifecycle & Processing Pipelines,2025-09-22T09:00:00Z,10.0,2819
+39709,Reproducible Data Science,2025-09-29T08:30:00Z,10.0,2819
+39710,Data Visualization,2025-10-06T08:30:00Z,10.0,2819
+39229,Lab 01: Introduction to Data Science Programming,2025-09-17T10:00:00Z,10.0,2819
+39230,Lab 02: The Data Science Lifecycle & Processing Pipelines,2025-09-26T10:00:00Z,10.0,2819
+39708,Lab 03: Reproducible Data Science,2025-10-01T10:00:00Z,10.0,2819
+40268,Lec 2: The Data Science Lifecycle & Processing Pipelines,2025-09-26T16:59:00Z,10.0,2819

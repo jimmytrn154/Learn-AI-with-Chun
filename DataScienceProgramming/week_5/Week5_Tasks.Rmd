@@ -1,0 +1,315 @@
+---
+title: "Week5_Tasks"
+author: "Tran Anh Chuong"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+  html_document: default
+date: "2025-10-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lubridate)
+library(scales)
+# global theme
+ggplot2::theme_set(ggplot2::theme_minimal(base_size = 12))
+cb_pal <- c("#1b9e77","#d95f02","#7570b3","#e7298a","#66a61e","#e6ab02","#a6761d","#666666")
+set.seed(42)
+```
+
+
+```{r Task 1 - Setup and Data Loading}
+library(readr)
+library(dplyr)
+### Task 1 – Get the data and print out first five row
+data <- read.csv("BankChurners.csv", , na = c("", "NA", "null"))
+head(data, 5)
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+# --- Setup ----
+# install.packages(c("kernlab","xgboost","janitor","forcats","corrplot")) # run once
+library(tidyverse)
+library(skimr)
+library(janitor)
+library(forcats)
+# install.packages("kernlab")   # pick a CRAN mirror if prompted
+library(corrplot)
+
+# --- Load & housekeeping (specific to BankChurners) ---
+df <- read_csv("BankChurners.csv") |> clean_names() #convert to snake case lower case
+
+# Drop ID + known leakage (precomputed NB scores)
+leak_cols <- grep("^naive_bayes_classifier_", names(df), value = TRUE)
+df <- df |>
+  select(-clientnum, -all_of(leak_cols)) |>
+  mutate(attrition_flag = factor(attrition_flag))   # target
+
+# --- Quick sanity checks ---
+glimpse(df)
+prop.table(table(df$attrition_flag))     # class balance
+skim(df)                                 # types + missingness overview
+dim(df)
+# --- Missingness detail ---
+miss_pct <- sapply(df, \(x) mean(is.na(x))) |> sort(TRUE)
+miss_pct[miss_pct > 0]
+
+# --- Basic summaries ---
+num_cols <- df |> select(where(is.numeric))
+cat_cols <- df |> select(where(\(.) is.character(.) || is.factor(.)))
+
+summary(num_cols)
+lapply(cat_cols, \(x) sort(prop.table(table(x)), decreasing = TRUE)[1:10])
+
+# --- Univariate visuals (spot skew/outliers) ---
+# Example numeric histograms
+num_cols |>
+  pivot_longer(everything(), names_to = "feature", values_to = "value") |>
+  ggplot(aes(value)) + geom_histogram(bins = 30) +
+  facet_wrap(~ feature, scales = "free") +
+  labs(title = "Numeric feature distributions")
+
+# Example categorical bars (top levels)
+cat_cols |>
+  pivot_longer(everything(), names_to = "feature", values_to = "value") |>
+  mutate(value = fct_lump_n(factor(value), n = 8, other_level = "Other")) |>
+  ggplot(aes(value)) + geom_bar() + coord_flip() +
+  facet_wrap(~ feature, scales = "free_y") +
+  labs(title = "Categorical level frequencies")
+
+# --- Churn relationship: categorical features ---
+cat_feats <- c("gender","education_level","marital_status","income_category","card_category")
+df |>
+  select(all_of(c("attrition_flag", cat_feats))) |>
+  pivot_longer(-attrition_flag, names_to = "feature", values_to = "level") |>
+  group_by(feature, level) |>
+  summarise(n = n(),
+            churn_rate = mean(attrition_flag == "Attrited Customer"), .groups = "drop") |>
+  arrange(feature, desc(churn_rate)) |>
+  ggplot(aes(x = fct_reorder(level, churn_rate), y = churn_rate)) +
+  geom_col() + coord_flip() + facet_wrap(~ feature, scales = "free_y") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Churn rate by categorical levels", x = NULL, y = "Churn rate")
+
+# --- Churn relationship: numeric features (decile plots) ---
+num_feats <- c("customer_age","months_on_book","months_inactive_12_mon",
+               "contacts_count_12_mon","credit_limit","total_revolving_bal",
+               "avg_open_to_buy","total_trans_amt",
+               "total_trans_ct","total_ct_chg_q4_q1","avg_utilization_ratio")
+
+
+
+# --- Quick EDA takeaways (print to console) ---
+# 1) class imbalance:
+prop.table(table(df$attrition_flag))
+# 2) top correlations with total_trans_ct (engagement proxy):
+sort(cor(select(df, where(is.numeric))$total_trans_ct,
+         select(df, where(is.numeric)), use = "pairwise.complete.obs"), decreasing = TRUE)[1:10]
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r task something}
+library(ggplot2)
+table(df$attrition_flag)
+prop.table(table(df$attrition_flag))
+
+df %>%
+  count(attrition_flag) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = attrition_flag, y = n, fill = attrition_flag)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.1f%%", pct)), vjust = -0.5) +
+  scale_fill_manual(values = c("#2E86AB", "#F26419")) +
+  labs(title = "Customer Attrition Distribution",
+       x = "Attrition Flag", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+*Existing customer rate of this bank is around 84%, outweigh the attrited customer, approximately 16% indicating that the service of the bank is relatively fine and is not on the verge of bankrupt.*
+
+```{r task 1}
+
+# Task 1 — Load & Glimpse
+
+df <- readr::read_csv("BankChurners.csv") |>
+  clean_names() |>
+  mutate(attrition_flag = factor(attrition_flag),
+         customer_age = as.numeric(customer_age),
+         months_on_book = as.numeric(months_on_book),
+         total_trans_ct = as.numeric(total_trans_ct),
+         total_trans_amt = as.numeric(total_trans_amt))
+
+# Preview
+head(df, 10)
+glimpse(df)
+
+```
+> **Variables (brief):** demographics (age, gender, education, income), account/tenure (`months_on_book`, `total_relationship_count`), behavior (`total_trans_ct`, `total_trans_amt`, `avg_utilization_ratio`, quarterly change fields), and **target** `attrition_flag` meaning the current status of bank user whether they are still using it ( Existing customer ) or they have left ( Attrited ).
+
+# Task 2 — Univariate Visualizations
+## 2.1 Numeric: Customer Age
+```{r uni-age}
+ggplot(df, aes(customer_age)) +
+  geom_histogram(bins = 30, fill = cb_pal[1]) +
+  labs(title = "Age distribution", x = "Age", y = "Count")
+```
+
+*Most customers are between ~40–55 years old; tails are light.*
+
+## 2.2 Categorical: Card Category
+
+```{r uni-card}
+df %>% count(card_category) %>%
+  ggplot(aes(fct_reorder(card_category, n), n, fill = card_category)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = cb_pal) +
+  labs(title = "Card category mix", x = NULL, y = "Customers")
+```
+*Blue dominates; higher tiers are rare—useful context for later rate comparisons.*
+
+# Task 3 — Bivariate Visualizations
+## 3.1 Churn by Gender
+```{r bi-gender}
+df %>% 
+  count(gender, attrition_flag) %>%
+  group_by(gender) %>% mutate(pct = n/sum(n)) %>% ungroup() %>%
+  ggplot(aes(gender, pct, fill = attrition_flag)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = cb_pal[c(2,3)]) +
+  labs(title = "Churn rate by gender", x = NULL, y = "Share", fill = "Status")
+```
+*Churn shares are similar across gender—little discriminatory power here.*
+
+## 3.2 Transactions vs Amount (log scale)
+```{r bi-amt-vs-ct}
+#Equal deciles
+plot_deciles <- function(df, feature, target = "attrition_flag", nbins = 10) {
+  tmp <- df |>
+    select(all_of(c(target, feature))) |>
+    filter(!is.na(.data[[feature]])) |>
+    mutate(bin = ntile(.data[[feature]], nbins)) |>
+    group_by(bin) |>
+    summarise(
+      bin_mid = median(.data[[feature]], na.rm = TRUE),
+      churn_rate = mean(.data[[target]] == "Attrited Customer"),
+      n = n(), .groups = "drop"
+    )
+  ggplot(tmp, aes(bin_mid, churn_rate)) +
+    geom_line() + geom_point() +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = paste("Churn vs", feature, "(deciles)"), x = feature, y = "Churn rate")
+}
+
+# Example: inspect a few high-signal features
+plot_deciles(df, "total_trans_ct")
+plot_deciles(df, "total_trans_amt")
+
+```
+*The churn rate decreases if total transaction count and total transaction amount per count are high.*
+
+# Task 4 — Multivariate Visualizations
+## 4.1 Churn vs Transactions, colored by Utilization
+```{r multi-trans-util}
+ggplot(df, aes(total_trans_ct, avg_utilization_ratio, color = attrition_flag)) +
+  geom_jitter(alpha = 0.25, width = 0.3, height = 0) +
+  scale_color_manual(values = cb_pal[c(2,3)]) +
+  labs(title = "Lower activity & higher utilization associate with churn",
+       x = "Total transactions (12m)", y = "Avg utilization ratio", color = "Status")
+```
+*Churners cluster at lower transaction counts and moderately higher utilization.*
+
+## 4.2 Boxplot: Transactions by Churn & Income
+```{r multi-box}
+df %>%
+  mutate(income_category = fct_lump_n(income_category, n = 5, other_level = "Other")) %>%
+  ggplot(aes(attrition_flag, total_trans_ct, fill = income_category)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  scale_fill_manual(values = cb_pal) +
+  labs(title = "Transactions differ by churn across income groups",
+       x = NULL, y = "Total transactions", fill = "Income")
+```
+*Across most incomes, churners transact less than existing customers by around 20%; Customer with high income range from around $60K to $120K often transacts more than other groups.*
+
+# Task 5 — Temporal or Composition Analysis
+*(No explicit time column; we’ll do **composition**.)*
+
+## 5.1 Product Relationship Count Composition by Churn
+```{r comp-rel}
+df %>% 
+  count(attrition_flag, total_relationship_count) %>%
+  group_by(attrition_flag) %>%
+  mutate(pct = n/sum(n)) %>% ungroup() %>%
+  ggplot(aes(factor(total_relationship_count), pct, fill = attrition_flag)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = cb_pal[c(2,3)]) +
+  labs(title = "More products correlate with retention",
+       x = "Total relationship count", y = "Share", fill = "Status")
+```
+*Customers holding more products (total relationship count) churn less—cross-sell relates to stickiness.*
+
+## Task 5.2 Relationship between Churn rate with month of inactivity and total contact counts
+```{r task 5.2}
+#Equal deciles
+plot_deciles <- function(df, feature, target = "attrition_flag", nbins = 10) {
+  tmp <- df |>
+    select(all_of(c(target, feature))) |>
+    filter(!is.na(.data[[feature]])) |>
+    mutate(bin = ntile(.data[[feature]], nbins)) |>
+    group_by(bin) |>
+    summarise(
+      bin_mid = median(.data[[feature]], na.rm = TRUE),
+      churn_rate = mean(.data[[target]] == "Attrited Customer"),
+      n = n(), .groups = "drop"
+    )
+  ggplot(tmp, aes(bin_mid, churn_rate)) +
+    geom_line() + geom_point() +
+    scale_y_continuous(labels = scales::percent) +
+    labs(title = paste("Churn vs", feature, "(deciles)"), x = feature, y = "Churn rate")
+}
+
+# Example: inspect a few high-signal features
+plot_deciles(df, "months_inactive_12_mon")
+plot_deciles(df, "contacts_count_12_mon")
+
+```
+*It is quite obvious that the more inactive a user is, the more likely they will become churners, this insight can be observed from the plot when group of people who are inactive in around 3-4 months. Likewise, those who often contact the bank is more likely to leave the bank also since they would have contacted frequently to complain about the service.*
+
+# Task 6 — (Optional) Small Multiples Heatmap
+```{r heatmap-contacts}
+df %>%
+  mutate(contacts_band = cut(contacts_count_12_mon, breaks = c(-Inf,0,1,2,3,4,Inf),
+                             labels = c("0","1","2","3","4","5+"))) %>%
+  count(contacts_band, months_inactive_12_mon, attrition_flag) %>%
+  group_by(contacts_band, months_inactive_12_mon) %>%
+  mutate(pct = n/sum(n)) %>% ungroup() %>%
+  ggplot(aes(contacts_band, months_inactive_12_mon, fill = pct)) +
+  geom_tile(color = "white") +
+  facet_wrap(~ attrition_flag) +
+  scale_fill_gradient(low = "white", high = cb_pal[1], labels = percent) +
+  labs(title = "Inactivity × Contacts pattern differs by churn",
+       x = "Contacts (12m)", y = "Months inactive (12m)", fill = "Share")
+```
+*Churners concentrate at higher inactivity with low–moderate contacts.*
+
+```{r task 8 — Narrative (5–10 sentences)}
+
+```
+- The dataset describes features such as bank customers, their product usage, credit utilization, and churn status.
+- Univariate views show a middle-aged customer base and a heavy skew toward the Blue card tier.
+- Bivariate plots indicate churn is not strongly gender-driven, but transaction activity tightly links to spend.
+- Multivariate views reveal churners tend to have **fewer transactions** and **higher utilization**. The income of customer also affect the total transaction count. 
+- Composition analysis shows holding **more products** aligns with retention—cross-sell likely reduces churn. Also for those who frequently contact the bank and less active in the banking system are the groups with high probability of becoming churners.
+- Heatmap of inactivity × contacts suggests **high inactivity** with limited contacts is a churn hotspot.
+- Overall, engagement (transactions), relationship breadth, and utilization are key signals for a churn determination
