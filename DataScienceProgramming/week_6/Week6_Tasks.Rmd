@@ -1,0 +1,274 @@
+---
+title: "Week6_Tasks"
+author: "Tran Anh Chuong"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+  html_document: default
+date: "2025-10-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Task 1 — Data Loading and Initial Exploration
+
+First, we load the necessary libraries. The `tidyverse` is a collection of R packages for data science, including `dplyr` for data manipulation and `readr` for reading data.
+
+```{r load-libraries}
+library(tidyverse)
+library(skimr) # For detailed summary statistics
+```
+
+### Dataset Characteristics
+
+- **Unit of analysis:** One row per customer; target = `Attrition_Flag`.
+- **Numerics:** activity (`Total_Trans_Ct`, `Total_Trans_Amt`), exposure (`Credit_Limit`, `Total_Revolving_Bal`), ratios (`Avg_Utilization_Ratio`, quarterly change rates), tenure/inactivity (months).
+- **Categoricals:** `Gender`, `Education_Level`, `Income_Category`, `Marital_Status`, `Card_Category`.
+- **Leakage/Redundancy:** `Naive_Bayes_Classifier_*` (pre-scored), `Avg_Open_To_Buy ≈ Credit_Limit - Total_Revolving_Bal`.
+- **Assumed bounds/units:** utilization in [0,1]; counts non-negative; amounts ≥ 0; tenure in months.
+
+```{r data-loading}
+# Load the dataset from the CSV file
+df <- read_csv('BankChurners.csv')
+
+# Display the first few rows
+head(df)
+```
+
+The original dataset includes two long `Naive_Bayes_Classifier_*` columns that are pre-scored and represent data leakage. We will remove them immediately.
+
+```{r drop-leakage-columns}
+# Remove the two Naive Bayes classifier columns by selecting them out
+# The 'select' function keeps columns, so we use '-' to remove them.
+data <- df %>%
+  select(
+    -`Naive_Bayes_Classifier_Attrition_Flag_Card_Category_Contacts_Count_12_mon_Dependent_count_Education_Level_Months_Inactive_12_mon_1`,
+    -`Naive_Bayes_Classifier_Attrition_Flag_Card_Category_Contacts_Count_12_mon_Dependent_count_Education_Level_Months_Inactive_12_mon_2`
+  )
+
+# Display the dimensions and first few rows of the cleaned data
+glimpse(data)
+```
+
+Let's get a summary of the data types and check for missing values. `glimpse()` is great for this.
+
+```{r initial-data-summary}
+# glimpse() provides a transposed view of the dataframe, showing column types and first values.
+glimpse(data)
+```
+
+Now, let's generate descriptive statistics for all numeric columns. `summary()` is the base R function for this.
+
+```{r numeric-summary}
+# summary() provides min, median, mean, max, and quartiles for numeric columns
+summary(data %>% select(where(is.numeric)))
+```
+
+We can also create a more detailed data dictionary to understand each column's role, type, and content.
+
+```{r data-dictionary}
+# This custom function replicates the Python notebook's data dictionary
+# Note: This is a more advanced R implementation for demonstration
+
+# Define a function to identify the role of each column
+get_role <- function(col_name) {
+  if (col_name == "Attrition_Flag") return("target")
+  if (col_name == "CLIENTNUM") return("id")
+  if (str_starts(col_name, "Naive_Bayes_Classifier_")) return("leakage")
+  return("feature")
+}
+
+# Define a function to get an example or range for a column
+get_example_or_range <- function(s) {
+  if (is.numeric(s)) {
+    str_glue("min={min(s, na.rm=TRUE)}, max={max(s, na.rm=TRUE)}")
+  } else {
+    # Get top 3 unique non-NA values
+    unique_vals <- s %>% na.omit() %>% unique() %>% head(3)
+    str_c(unique_vals, collapse = ", ")
+  }
+}
+
+data_dictionary <- tibble(
+  column = names(data),
+  role = map_chr(column, get_role),
+  type = map_chr(data, ~class(.)[1]),
+  n_missing = map_int(data, ~sum(is.na(.))),
+  pct_missing = map_dbl(data, ~mean(is.na(.)) * 100),
+  n_unique = map_int(data, n_distinct),
+  example_or_range = map_chr(data, get_example_or_range)
+) %>%
+  arrange(role, column)
+
+# Print the data dictionary
+print(data_dictionary, n = 25)
+```
+
+### Assumptions
+- `CLIENTNUM` is a customer identifier.
+- `Avg_Utilization_Ratio` is within [0,1].
+- Tenure fields are non-negative and measured in months.
+
+Let's check for outlier share using the IQR method.
+
+```{r outlier-detection}
+# Function to calculate the share of outliers based on 1.5 * IQR rule
+calculate_outlier_share <- function(x) {
+  if (!is.numeric(x)) return(NA)
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower_bound <- q1 - 1.5 * iqr
+  upper_bound <- q3 + 1.5 * iqr
+  mean(x < lower_bound | x > upper_bound, na.rm = TRUE)
+}
+
+# Apply the function to all numeric columns and sort the result
+data %>%
+  select(where(is.numeric)) %>%
+  map_dbl(calculate_outlier_share) %>%
+  sort(decreasing = TRUE)
+```
+
+---
+
+## Task 2 — Cleaning
+
+### Strategy
+- Trimmed/squished text, normalized case for key categoricals; parsed numeric strings to numbers.
+- Median imputed numeric NAs; added `"missing"` category to categorical fields.
+- Dropped full row duplicates; removed NB classifier scores and plan to drop `Naive_Bayes_Classifier_` columns due to redundancy, which is also mentioned by the author of the dataset.
+- Preserved the original file (`df_raw`) and worked on a copy (`df`) for reproducibility.
+
+```{r cleaning-steps}
+# Start with the 'data' dataframe which has leakage columns removed
+df_clean <- data
+
+# Cleaning character columns: trim whitespace and normalize case
+df_clean <- df_clean %>%
+  mutate(
+    across(where(is.character), str_trim),
+    Gender = str_to_upper(Gender),
+    Education_Level = str_to_title(Education_Level)
+  )
+
+# Convert character columns with a limited number of unique values to factors
+df_clean <- df_clean %>%
+  mutate(across(c(Attrition_Flag, Gender, Education_Level, Marital_Status, Income_Category, Card_Category), as.factor))
+
+# Remove duplicate rows
+df_clean <- df_clean %>%
+  distinct()
+
+# Note: The original dataset had no missing values. The code below is how you would handle them.
+# For demonstration: Median imputation for numerics and adding a "missing" category for factors.
+
+# num_cols <- df_clean %>% select(where(is.numeric)) %>% names()
+# cat_cols <- df_clean %>% select(where(is.factor)) %>% names()
+#
+# df_clean <- df_clean %>%
+#   mutate(across(all_of(num_cols), ~replace_na(., median(., na.rm = TRUE)))) %>%
+#   mutate(across(all_of(cat_cols), ~fct_explicit_na(., "missing")))
+
+glimpse(df_clean)
+```
+
+---
+
+## Task 3 — Transformations
+
+### Feature engineering logic
+- `inactivity_ratio` reflects disengagement risk; `trans_intensity` reflects engagement.
+- `age_group` indicate better generalization for the dataset since the age varies from many sectors. Thus, group in to groups such as <=30, 31-40 will helps.
+- Log transforms reduce skew for spend/limits; age groups aid reporting and monotonic behavior.
+
+
+```{r feature-engineering}
+df_fe <- df_clean %>%
+  mutate(
+    # Create age groups
+    age_group = cut(
+      Customer_Age,
+      breaks = c(0, 30, 40, 50, 60, 200),
+      labels = c("<=30", "31-40", "41-50", "51-60", "60+"),
+      right = TRUE
+    ),
+    
+    # Create new ratio features
+    inactivity_ratio = if_else(Months_on_book > 0, Months_Inactive_12_mon / Months_on_book, NA_real_),
+    trans_intensity = if_else(Months_on_book > 0, Total_Trans_Ct / Months_on_book, NA_real_),
+
+    # Add log-transformed versions of skewed numeric columns
+    Total_Trans_Amt_log = log1p(Total_Trans_Amt),
+    Total_Trans_Ct_log = log1p(Total_Trans_Ct),
+    Credit_Limit_log = log1p(Credit_Limit)
+  )
+
+# R's modeling functions (like lm, glm) handle factors automatically,
+# so explicit one-hot encoding is often not needed for modeling.
+# For other purposes, you could use libraries like 'fastDummies'.
+# For this script, we'll keep the factor columns as they are.
+
+glimpse(df_fe)
+```
+
+---
+
+## Task 4 — Aggregation & Final Dataset
+
+Now, we can perform aggregations to derive insights. Let's analyze customer behavior by age group and attrition status.
+
+```{r aggregation-by-age}
+by_age <- df_fe %>%
+  group_by(age_group, Attrition_Flag) %>%
+  summarize(
+    client_count = n(),
+    avg_trans = mean(Total_Trans_Ct, na.rm = TRUE),
+    avg_spend = mean(Total_Trans_Amt, na.rm = TRUE),
+    util_med = median(Avg_Utilization_Ratio, na.rm = TRUE),
+    .groups = 'drop' # Drop grouping structure after summarizing
+  )
+
+head(by_age)
+```
+
+Let's also calculate the churn rate for each card category.
+
+```{r aggregation-by-card-category}
+churn_by_card <- df_fe %>%
+  group_by(Card_Category, Attrition_Flag) %>%
+  summarize(n = n(), .groups = 'drop') %>%
+  group_by(Card_Category) %>%
+  mutate(churn_rate = n / sum(n)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = Attrition_Flag, values_from = churn_rate, values_fill = 0)
+
+head(churn_by_card)
+```
+
+The final dataset is now ready for modeling or further analysis.
+
+```{r final-dataset-prep}
+# The final dataset is df_fe.
+# If we were to save it for modeling, we might drop identifier columns.
+final_df <- df_fe %>%
+  select(-CLIENTNUM, -Avg_Open_To_Buy) # Drop ID and redundant column
+
+# final_df %>% write_csv("bankchurn_final_clean_r.csv")
+
+# Final shape of the dataset
+dim(final_df)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
