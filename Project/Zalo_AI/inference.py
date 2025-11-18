@@ -1,109 +1,318 @@
-import json, argparse
+# inference.py
+import os, json, time, math, argparse
 import numpy as np
+import cv2
 import torch
-import cv2, math, time
-from pathlib import Path
+import torch.nn.functional as F
 
-from common import (
-    find_episodes, load_refs_for_episode, video_path_for_episode,
-    YOLOProposals, EmbeddingMatcher, build_template, nms_xyxy,
-    TemporalHead, IoUHead, SingleTargetTracker, segmentize
-)
+from matcher import ImageMatcher          # your existing embedder wrapper
+from proposals import YOLOProposals
+from utils import list_episode_dirs, load_refs_for_episode, ensure_dir
+
+# --------------- helpers -----------------
+
+def crop_xyxy(img, box, pad=0.0):
+    x1, y1, x2, y2 = box
+    H, W = img.shape[:2]
+    if pad > 0:
+        w = x2 - x1; h = y2 - y1
+        cx = (x1 + x2) / 2.0; cy = (y1 + y2) / 2.0
+        w2 = w * (1.0 + pad); h2 = h * (1.0 + pad)
+        x1 = int(max(0, math.floor(cx - w2/2))); y1 = int(max(0, math.floor(cy - h2/2)))
+        x2 = int(min(W, math.ceil(cx + w2/2)));  y2 = int(min(H, math.ceil(cy + h2/2)))
+    return img[y1:y2, x1:x2]
+
+def roi_expand(box, pad, W, H):
+    if box is None:
+        return (0, 0, W, H)
+    x1, y1, x2, y2 = box
+    w = x2 - x1; h = y2 - y1
+    cx = (x1 + x2) / 2.0; cy = (y1 + y2) / 2.0
+    w2 = w * (1.0 + pad); h2 = h * (1.0 + pad)
+    X1 = int(max(0, math.floor(cx - w2/2))); Y1 = int(max(0, math.floor(cy - h2/2)))
+    X2 = int(min(W, math.ceil(cx + w2/2)));  Y2 = int(min(H, math.ceil(cy + h2/2)))
+    return (X1, Y1, X2, Y2)
+
+def iou_xyxy(a, b):
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    if inter == 0: return 0.0
+    area_a = max(0, ax2-ax1) * max(0, ay2-ay1)
+    area_b = max(0, bx2-bx1) * max(0, by2-by1)
+    return inter / (area_a + area_b - inter + 1e-6)
+
+def percentile(x, p):
+    if len(x) == 0: return 0.0
+    return float(np.percentile(np.asarray(x, dtype=np.float32), p))
+
+# --------------- warm-up -----------------
+
+def warmup_thresholds(matcher, props, cap, num_frames=120, stride=10, roi_pad=0.0):
+    """
+    Sample some frames, compute cosine scores for top few proposals to pick per-video thresholds.
+    """
+    cosvals = []
+    fidx = 0
+    while True and len(cosvals) < 200:
+        ok, frame = cap.read()
+        if not ok: break
+        fidx += 1
+        if (fidx-1) % stride != 0: continue
+        boxes = props(frame)
+        confs = getattr(props, "last_scores", None) or [0.0] * len(boxes)
+        if len(boxes) == 0: continue
+        # take top-N by YOLO conf so we're sampling "likely" regions
+        order = np.argsort(-np.asarray(confs, dtype=np.float32))
+        take = order[: min(10, len(order))]
+        crops = [crop_xyxy(frame, boxes[i]) for i in take]
+        embs = matcher.encode_np(crops)  # (N, D)
+        tmpl = matcher.get_template().reshape(1, -1)  # (1, D)
+        cos = F.linear(torch.from_numpy(embs), torch.from_numpy(tmpl)).squeeze(1).numpy().tolist()
+        cosvals.extend(cos)
+        if fidx >= num_frames: break
+
+    # conservative defaults if nothing gathered
+    if len(cosvals) == 0:
+        return 0.34, 0.20   # fallback
+
+    hi = percentile(cosvals, 72)  # ~70-75th percentile
+    lo = percentile(cosvals, 52)  # ~50-55th percentile
+    return float(hi), float(lo)
+
+# --------------- main inference per episode -----------------
+
+def run_episode(root, vid, matcher, props, C):
+    """
+    C: config dict with keys like alpha_fuse, temporal_T, tau_high/low, roi_pad, etc.
+    """
+    vpath = os.path.join(root, "samples", vid, "drone_video.mp4")
+    cap = cv2.VideoCapture(vpath)
+    if not cap.isOpened():
+        raise FileNotFoundError(vpath)
+
+    # Build per-video template once
+    refs = load_refs_for_episode(root, vid)  # list of BGR ref images
+    tmpl = matcher.encode_np(refs, augs_per_ref=16).mean(axis=0, keepdims=True)  # (1,D)
+    matcher.set_template(tmpl)
+
+    # Warm-up to pick tau_* automatically
+    cap_warm = cv2.VideoCapture(vpath)
+    tau_hi_auto, tau_lo_auto = warmup_thresholds(matcher, props, cap_warm,
+                                                 num_frames=C.get("warmup_frames", 120),
+                                                 stride=max(1, C.get("frame_stride", 2)),
+                                                 roi_pad=0.0)
+    cap_warm.release()
+        # AFTER (safe even if JSON has "null")
+    def _coalesce(val, fallback):
+        return fallback if val is None else val
+
+    tau_high_cos = _coalesce(C.get("tau_high_cos"), tau_hi_auto)
+    tau_low_cos  = _coalesce(C.get("tau_low_cos"),  tau_lo_auto)
+    # If tau_high/low are None, fall back to the cosine thresholds
+    tau_high     = _coalesce(C.get("tau_high"), tau_high_cos)
+    tau_low      = _coalesce(C.get("tau_low"),  tau_low_cos)
+
+    if C.get("topk_debug", 0):
+        print(f"[THRESH] auto_hi_cos={tau_hi_auto:.3f} auto_lo_cos={tau_lo_auto:.3f} "
+            f"=> tau_high_cos={tau_high_cos:.3f} tau_low_cos={tau_low_cos:.3f} "
+            f"tau_high={tau_high:.3f} tau_low={tau_low:.3f}")
+    alpha_fuse   = C.get("alpha_fuse", 0.88)
+    roi_pad      = C.get("roi_pad", 0.40)
+    min_commit   = C.get("min_commit", 1)
+    max_lost     = C.get("max_lost", 25)
+    topk_debug   = C.get("topk_debug", 0)
+
+    detections = []
+    lost = 0
+    fidx = 0
+    last_box = None
+    active = False
+    committed = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok: break
+        fidx += 1
+        if C.get("frame_stride", 2) > 1 and ((fidx-1) % C["frame_stride"]) != 0:
+            continue
+
+        H, W = frame.shape[:2]
+
+        # proposals
+        boxes = props(frame)
+        confs = getattr(props, "last_scores", None) or [0.0] * len(boxes)
+
+        # compute an adaptive pad based on last displacement
+        if last_box is not None and "roi_pad" in C:
+            if "_prev_center" not in locals(): _prev_center = None
+            cx = 0.5*(last_box[0]+last_box[2]); cy = 0.5*(last_box[1]+last_box[3])
+            if _prev_center is not None:
+                dx = abs(cx - _prev_center[0]) / max(1, W)
+                dy = abs(cy - _prev_center[1]) / max(1, H)
+                jump = max(dx, dy)
+            else:
+                jump = 0.0
+            _prev_center = (cx, cy)
+            roi_pad_eff = float(C.get("roi_pad", 0.55)) * (1.0 + 1.5 * min(0.2, jump))
+        else:
+            roi_pad_eff = float(C.get("roi_pad", 0.55))
+
+        # ROI filtering when a track exists
+        if last_box is not None:
+            X1, Y1, X2, Y2 = roi_expand(last_box, roi_pad_eff, W, H)
+            keep = []
+            for i, (x1, y1, x2, y2) in enumerate(boxes):
+                cx = 0.5*(x1+x2); cy = 0.5*(y1+y2)
+                if (X1 <= cx <= X2) and (Y1 <= cy <= Y2):
+                    keep.append(i)
+            if len(keep) > 0:
+                boxes = [boxes[i] for i in keep]
+                confs = [confs[i] for i in keep]
+
+        if len(boxes) == 0:
+            # miss
+            if active:
+                lost += 1
+                if lost > max_lost:
+                    active = False; last_box = None; committed = 0
+            continue
+
+        crops = [crop_xyxy(frame, b) for b in boxes]
+        embs = matcher.encode_np(crops)  # (N,D)
+        cos = F.linear(torch.from_numpy(embs), torch.from_numpy(matcher.get_template())).squeeze(1).numpy()
+        cos = cos.astype(np.float32)
+        confs = np.asarray(confs, dtype=np.float32)
+
+        # normalize YOLO conf into [0,1] (already is), fuse
+        fused = alpha_fuse * cos + (1.0 - alpha_fuse) * confs
+
+        # pick best by fused, but gate by both
+        order = np.argsort(-fused)
+        def diverse_topk(boxes, scores, K=10, iou_thr=0.7):
+            keep = []
+            for i in order:
+                ok = True
+                for j in keep:
+                    if iou_xyxy(boxes[i], boxes[j]) > iou_thr:
+                        ok = False; break
+                if ok: keep.append(i)
+                if len(keep) >= K: break
+            return keep
+
+        div_idx = diverse_topk(boxes, fused, K=min(10, len(boxes)), iou_thr=0.7)
+        bidx = div_idx[0]  # best among diverse set
+        
+        EMA_BETA = C.get("ema_beta", 0.10)
+        if (bcos >= tau_high_cos) or (bfuse >= tau_high):
+            # update template with current best crop
+            emb_best = torch.from_numpy(matcher.encode_np([crop_xyxy(frame, b)])).squeeze(0).numpy()
+            tmpl = matcher.get_template()
+            tmpl = (1.0 - EMA_BETA) * tmpl + EMA_BETA * emb_best[None, :]
+            # L2 normalize
+            tmpl = tmpl / max(1e-6, np.linalg.norm(tmpl))
+            matcher.set_template(tmpl)
+        
+        bcos = float(cos[bidx]); bfuse = float(fused[bidx])
+        b = boxes[bidx]
+
+        # optional debug top-K
+        if topk_debug > 0:
+            K = min(topk_debug, len(order))
+            print(f"[TOPK] {vid} f={fidx} K={K} margin={bfuse - float(fused[order[1]]) if len(order)>1 else 1.0:.3f}")
+            for k in range(K):
+                i = order[k]
+                x1,y1,x2,y2 = boxes[i]
+                print(f"  #{k+1}: fused={fused[i]:+.3f}  cos={cos[i]:+.3f}  y={confs[i]:+.3f}  "
+                      f"wh=({x2-x1}, {y2-y1})  box=({x1}, {y1}, {x2}, {y2})")
+
+        # hysteresis logic
+        if not active:
+            if (bcos >= tau_high_cos) or (bfuse >= tau_high):
+                active = True
+                last_box = b
+                committed = 0
+            else:
+                # stay idle
+                continue
+        else:
+            if (bcos < tau_low_cos) and (bfuse < tau_low):
+                lost += 1
+                if lost > max_lost:
+                    active = False; last_box = None; committed = 0
+                continue
+            else:
+                lost = 0
+                last_box = b
+
+        # commit if active and beyond warm-up length
+        committed += 1
+        if committed >= min_commit:
+            detections.append({"bboxes": [{"frame": fidx, "x1": last_box[0], "y1": last_box[1],
+                                           "x2": last_box[2], "y2": last_box[3]}]})
+
+    cap.release()
+    return {"video_id": vid, "detections": detections}
+
+
+# --------------- top-level -----------------
+
+def run_inference_on_split(data_root, vids, ckpt, cfg, yolo_ckpt, debug=False):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # matcher: frozen feature extractor (e.g., RN18/RN50/CLIP/DINOv2 behind ImageMatcher)
+    matcher = ImageMatcher(device=device)
+
+    # proposals: now with your trained YOLO + multi-scale TTA
+    tta_sizes = cfg.get("tta_sizes", [cfg.get("imgsz", 960)])
+    props = YOLOProposals(
+        yolo_ckpt=yolo_ckpt,
+        imgsz=cfg.get("imgsz", 960),
+        conf=cfg.get("conf", 0.02),
+        nms_iou=cfg.get("nms_iou", 0.60),
+        max_props=cfg.get("max_props", 80),
+        tta_sizes=tta_sizes,
+        device=0 if torch.cuda.is_available() else None,
+        half=True,
+        allow_fallback=True,
+        min_wh=cfg.get("min_wh", 8),
+        min_area=cfg.get("min_area", 36),
+        debug=debug,
+    )
+
+    preds = []
+    for vid in vids:
+        t0 = time.time()
+        out = run_episode(data_root, vid, matcher, props, cfg)
+        dt = time.time() - t0
+        print(f"[DONE] {vid}: {len(out['detections'])} segments, {dt:.1f}s")
+        preds.append(out)
+    return preds
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", required=True)
-    ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--out", default="./viz_test/predictions.json")
-    ap.add_argument("--yolo_ckpt", type=str, default=None)
-    ap.add_argument("--yolo_off", action='store_true')
-    ap.add_argument("--debug", action='store_true')
+    ap.add_argument("--ckpt", required=True, help="(kept for compatibility; matcher is frozen)")
+    ap.add_argument("--config", required=True, help="JSON with all thresholds/hparams")
+    ap.add_argument("--yolo_ckpt", default=None, help="Your trained YOLO weights (*.pt)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.config,"r",encoding="utf-8") as f: C = json.load(f)
+    with open(args.config, "r", encoding="utf-8") as f:
+        C = json.load(f)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    props = YOLOProposals(conf=C["conf"], iou=C["nms_iou"], imgsz=C["imgsz"],
-                          max_candidates=C["max_props"], device=0,
-                          yolo_on=not args.yolo_off, yolo_ckpt=args.yolo_ckpt, debug=args.debug)
-    matcher = EmbeddingMatcher(out_dim=256).to(device).eval()
-    temp_head = TemporalHead().to(device).eval()
-    iou_head  = IoUHead().to(device).eval()
-    sd = torch.load(args.ckpt, map_location=device)
-    temp_head.load_state_dict(sd["temporal_head"]) ; iou_head.load_state_dict(sd["iou_head"])
+    vids = list_episode_dirs(args.data_root)  # returns list of folder names under samples/
+    ensure_dir(os.path.dirname(args.out))
 
-    vids = find_episodes(args.data_root)
-    preds=[]
-    for vid in vids:
-        print(f"[RUN] {vid}")
-        refs = load_refs_for_episode(args.data_root, vid)
-        tmpl = build_template(matcher, refs, device=device, augs_per_ref=12, use_adapter=True, debug=args.debug)
-        cap = cv2.VideoCapture(video_path_for_episode(args.data_root, vid))
-        tracker = SingleTargetTracker(tau_high=C["tau_high"], tau_low=C["tau_low"],
-                                      assoc_lambda=C["assoc_lambda"],
-                                      max_lost=max(10,3*C["frame_stride"]),
-                                      min_commit=2, gap_fill=max(1,C["frame_stride"]-1),
-                                      frame_stride=C["frame_stride"], debug=args.debug)
-        seq_buf=[]; last_geom=None; fidx=0
-        while True:
-            ok, frame = cap.read()
-            if not ok: break
-            fidx += 1  # 1-based
-            if C["frame_stride"]>1 and ((fidx-1) % C["frame_stride"])!=0:
-                continue
-            t0=time.time(); boxes = props(frame); t_prop=time.time()-t0
-            crops = [frame[y1:y2, x1:x2] for (x1,y1,x2,y2) in boxes]
-            t1=time.time(); embs  = matcher.encode_np(crops, device); t_emb=time.time()-t1
-            cos   = (embs @ tmpl.T).squeeze(1).detach().cpu().numpy() if embs.numel()>0 else np.zeros((0,),dtype=np.float32)
-            H,W = frame.shape[:2]; feat_rows=[]
-            for b,s in zip(boxes, cos):
-                x1,y1,x2,y2=b
-                cx=(x1+x2)/2; cy=(y1+y2)/2; w=max(1.0,x2-x1); h=max(1.0,y2-y1)
-                if last_geom is None:
-                    dx=dy=ds=dh=dw=0.0
-                else:
-                    lcx,lcy,lw,lh = last_geom
-                    dx=(cx-lcx)/max(1.0,W); dy=(cy-lcy)/max(1.0,H)
-                    ds=math.log(w/max(1.0,lw)); dh=math.log(h/max(1.0,lh))
-                    dw=math.log((w/h)/max(1e-6,lw/lh))
-                feat_rows.append([float(s),dx,dy,ds,dh,dw])
-            keep = nms_xyxy(boxes, cos, iou_thr=C["nms_final_iou"]) 
-            boxes = [boxes[i] for i in keep]; sims=[float(cos[i]) for i in keep]
-            feats=[feat_rows[i] for i in keep]
-            if feats:
-                seq_buf.append(feats[0])
-                if len(seq_buf)>C["temporal_T"]: seq_buf.pop(0)
-                seq = torch.tensor(seq_buf, dtype=torch.float32, device=device).unsqueeze(0).repeat(len(feats),1,1)
-                s_temp = temp_head(seq).squeeze(-1).detach().cpu().numpy()
-                s_iou  = iou_head(torch.tensor(feats, dtype=torch.float32, device=device)).squeeze(-1).detach().cpu().numpy()
-                fused = (C["alpha_fuse"]*np.array(sims) + (1-C["alpha_fuse"]) * s_temp) * 0.5 + 0.5*s_iou
-            else:
-                fused=[]
-            tracker.update(fidx, boxes, fused)
-            if boxes:
-                bi = int(np.argmax(fused)); x1,y1,x2,y2 = boxes[bi]
-                last_geom=((x1+x2)/2,(y1+y2)/2,max(1.0,x2-x1),max(1.0,y2-y1))
-            if args.debug and (fidx % (5*C["frame_stride"]) == 1):
-                print(f"[DBG] {vid} f={fidx} props={len(boxes)} t_prop={t_prop:.3f}s t_emb={t_emb:.3f}s")
-        cap.release()
-        segs = segmentize(tracker.detections, max_gap=C["frame_stride"]) 
-        preds.append({"video_id": vid, "detections": segs})
-        out_path = Path(args.out); tmp = out_path.with_suffix(".tmp.json")
-        cur = []
-        if out_path.exists():
-            try:
-                with open(out_path,"r",encoding="utf-8") as f: cur=json.load(f)
-            except Exception: cur=[]
-        cur = [e for e in cur if e.get("video_id") != vid]
-        cur.append({"video_id": vid, "detections": segs})
-        with open(tmp,"w",encoding="utf-8") as f: json.dump(cur, f, indent=2)
-        tmp.replace(out_path)
-        print(f"[DONE] {vid}: {sum(len(s['bboxes']) for s in segs)} boxes, {len(segs)} segments")
-    with open(args.out,"w",encoding="utf-8") as f: json.dump(preds, f, indent=2)
-    print(f"[SAVE] {args.out}")
+    preds = run_inference_on_split(args.data_root, vids, args.ckpt, C, args.yolo_ckpt, debug=args.debug)
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(preds, f, indent=2)
+    print(f"[SAVE] predictions -> {args.out}")
+
 
 if __name__ == "__main__":
     main()
