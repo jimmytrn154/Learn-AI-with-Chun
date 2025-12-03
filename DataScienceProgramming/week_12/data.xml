@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<root>
+    <item>
+        <name>Product A</name>
+        <value>100</value>
+    </item>
+    <item>
+        <name>Product B</name>
+        <value>200</value>
+    </item>
+    <item>
+        <name>Product C</name>
+        <value>150</value>
+    </item>
+</root>

@@ -1,0 +1,6 @@
+id,name,department,salary
+1,Alice,Engineering,75000.0
+2,Bob,Marketing,65000.0
+3,Charlie,Engineering,80000.0
+4,David,Sales,60000.0
+5,Emma,Marketing,70000.0
