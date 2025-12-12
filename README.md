@@ -76,6 +76,3 @@ Welcome to my digital laboratory. This repository is more than just homework; it
 
 -----
 
-### 💡 What I can do for you next:
-
-Would you like me to generate a **`requirements.txt`** file based on the imports likely found in these scripts (like pandas, numpy, scikit-learn) so users can easily install the dependencies?
