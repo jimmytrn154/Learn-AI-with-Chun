@@ -26,6 +26,4 @@ data2.csv
 TOMPEI-CMMD/
 
 # Ignore generated outputs (optional - uncomment if you don't want to track outputs)
-# datathon.ipynb
-# datathon_dashboard.png
 generate_notebook.py
