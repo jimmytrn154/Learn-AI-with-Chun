@@ -135,8 +135,73 @@ if len(members_df) > 0:
 cells.append(nbf.v4.new_code_cell("""# ── Summary Statistics Card ───────────────────────────────────
 total_teams = len(df)
 total_participants = len(members_df) if len(members_df) > 0 else df['team_size'].sum()
-unique_institutions = df['institution'].nunique()
 avg_team_size = df['team_size'].mean()
+
+# Normalization mapping for common universities
+norm_map = {
+    'hust': 'HUST (Hanoi)',
+    'báchkhoahànội': 'HUST (Hanoi)',
+    'hanoiuniversityofscience': 'HUST (Hanoi)',
+    'fpt': 'FPT University',
+    'vinuni': 'VinUniversity',
+    'khoahọctựnhiên': 'VNUHCM - Science',
+    'universityofscience': 'VNUHCM - Science',
+    'vnuhcm': 'VNUHCM - Science',
+    'côngnghệthôngtin': 'UIT',
+    'uit': 'UIT',
+    'informationtechnology': 'UIT',
+    'kinhtếquốcdân': 'NEU',
+    'neu': 'NEU',
+    'kinhtếluật': 'UEL',
+    'uel': 'UEL',
+    'báchkhoatp': 'HCMUT',
+    'hcmut': 'HCMUT',
+    'ngoạithương': 'FTU',
+    'ftu': 'FTU',
+    'giaothôngvậntải': 'UTC',
+    'utc': 'UTC'
+}
+
+def clean_university(name):
+    if pd.isna(name): return name
+    nl = str(name).lower().replace(" ", "").replace("-", "")
+    for k, v in norm_map.items():
+        if k in nl: return v
+    return str(name).strip()
+
+df['institution_clean'] = df['institution'].apply(clean_university)
+
+if len(members_df) > 0 and 'major' in members_df.columns:
+    # Normalize major names (e.g. "Khoa học Máy tính" -> "Khoa học máy tính")
+    members_df['major'] = members_df['major'].str.strip().str.capitalize()
+
+# Institution counts at MEMBER level (since teams can span multiple universities)
+if len(members_df) > 0 and 'university' in members_df.columns:
+    members_df['university_clean'] = members_df['university'].apply(clean_university)
+    
+    city_map = {
+        'HUST (Hanoi)': 'Hanoi', 'VinUniversity': 'Hanoi', 'NEU': 'Hanoi',
+        'VNUHCM - Science': 'Ho Chi Minh City', 'UIT': 'Ho Chi Minh City',
+        'UEL': 'Ho Chi Minh City', 'HCMUT': 'Ho Chi Minh City', 'UTC': 'Ho Chi Minh City',
+        'FPT University': 'Multi-campus/Other', 'FTU': 'Multi-campus/Other'
+    }
+    def assign_city(row):
+        u_clean = row['university_clean']
+        u_raw = str(row['university']).lower()
+        if u_clean in city_map: return city_map[u_clean]
+        if any(x in u_raw for x in ['hồ chí minh', 'hcm', 'sài gòn', 'mở tp']): return 'Ho Chi Minh City'
+        if any(x in u_raw for x in ['hà nội', 'hanoi']): return 'Hanoi'
+        if any(x in u_raw for x in ['đà nẵng', 'danang']): return 'Da Nang'
+        if any(x in u_raw for x in ['cần thơ', 'cantho']): return 'Can Tho'
+        return 'Multi-campus/Other'
+    
+    members_df['city'] = members_df.apply(assign_city, axis=1)
+    
+    inst_counts = members_df['university_clean'].dropna().value_counts()
+    unique_institutions = members_df['university_clean'].dropna().nunique()
+else:
+    inst_counts = df['institution_clean'].value_counts()
+    unique_institutions = df['institution_clean'].nunique()
 
 # Detect submission column(s)
 submission_cols = [c for c in df.columns if 'submission' in c.lower() or 'Submission' in c]
@@ -162,12 +227,12 @@ if status_col is None:
 print("=" * 52)
 print("         📊 DATATHON — KEY METRICS")
 print("=" * 52)
-print(f"  🏫 Institutions represented:  {unique_institutions}")
-print(f"  👥 Total teams registered:    {total_teams}")
-print(f"  🧑 Total participants:        {total_participants}")
-print(f"  📐 Average team size:         {avg_team_size:.1f}")
+print(f"  🏫 Institutions (member-level): {unique_institutions}")
+print(f"  👥 Total teams registered:      {total_teams}")
+print(f"  🧑 Total participants:          {total_participants}")
+print(f"  📐 Average team size:           {avg_team_size:.1f}")
 if submitted != 'N/A':
-    print(f"  📝 Round 1 submissions:       {submitted} ({submission_rate:.1f}%)")
+    print(f"  📝 Round 1 submissions:         {submitted} ({submission_rate:.1f}%)")
 print("=" * 52)"""))
 
 # ============================================================
@@ -225,10 +290,11 @@ plt.show()"""))
 # SECTION 4: INSTITUTION DISTRIBUTION
 # ============================================================
 cells.append(nbf.v4.new_markdown_cell("""---
-## 4. Institution Distribution"""))
+## 4. Institution Distribution
+> ⚠️ Counted at the **individual member level** (from the `university` field), since teams can include members from multiple institutions."""))
 
-cells.append(nbf.v4.new_code_cell("""# ── Top Institutions Bar Chart ────────────────────────────────
-inst_counts = df['institution'].value_counts()
+cells.append(nbf.v4.new_code_cell("""# ── Top Institutions Bar Chart (MEMBER-level university) ──────
+# inst_counts was already computed from members_df['university'] in Section 2
 top_n = min(15, len(inst_counts))
 top_inst = inst_counts.head(top_n)
 
@@ -241,18 +307,18 @@ axes[0].set_yticks(range(top_n))
 # Truncate long names
 labels = [name[:40] + '...' if len(str(name)) > 40 else str(name) for name in top_inst.index[::-1]]
 axes[0].set_yticklabels(labels, fontsize=10)
-axes[0].set_xlabel('Number of Teams')
-axes[0].set_title(f'🏫 Top {top_n} Institutions by Team Count')
+axes[0].set_xlabel('Number of Participants')
+axes[0].set_title(f'🏫 Top {top_n} Institutions by Participant Count')
 
 for bar, val in zip(bars, top_inst.values[::-1]):
     axes[0].text(val + 0.2, bar.get_y() + bar.get_height()/2,
                  f'{val}', va='center', fontsize=10, fontweight='bold')
 
 # Pie chart: top 5 + Other
-top5 = inst_counts.head(5)
-other = inst_counts.iloc[5:].sum() if len(inst_counts) > 5 else 0
-pie_data = list(top5.values)
-pie_labels = [str(n)[:25] for n in top5.index]
+top8 = inst_counts.head(8)
+other = inst_counts.iloc[8:].sum() if len(inst_counts) > 8 else 0
+pie_data = list(top8.values)
+pie_labels = [str(n)[:25] for n in top8.index]
 if other > 0:
     pie_data.append(other)
     pie_labels.append('Other')
@@ -260,11 +326,11 @@ if other > 0:
 wedges, texts, autotexts = axes[1].pie(
     pie_data, labels=pie_labels, autopct='%1.1f%%',
     colors=PALETTE[:len(pie_data)], startangle=140,
-    pctdistance=0.75, textprops={'fontsize': 9}
+    pctdistance=0.8, textprops={'fontsize': 9}
 )
 for autotext in autotexts:
     autotext.set_fontweight('bold')
-axes[1].set_title('🎯 Institution Share')
+axes[1].set_title('🎯 Institution Share (by participants)')
 
 fig.tight_layout()
 plt.show()"""))
@@ -276,7 +342,7 @@ cells.append(nbf.v4.new_markdown_cell("""---
 ## 5. Team Size & Member Demographics"""))
 
 cells.append(nbf.v4.new_code_cell("""# ── Team Size Distribution ────────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+fig, axes = plt.subplots(1, 3, figsize=(20, 5))
 
 # Histogram
 size_counts = df['team_size'].value_counts().sort_index()
@@ -303,6 +369,24 @@ else:
     axes[1].text(0.5, 0.5, 'Role data not available', ha='center', va='center',
                  fontsize=14, transform=axes[1].transAxes)
     axes[1].set_title('🎭 Member Roles')
+
+# City distribution
+if len(members_df) > 0 and 'city' in members_df.columns:
+    city_counts = members_df['city'].value_counts()
+    # Pull out "Multi-campus/Other" to the end for better visual sorting
+    if 'Multi-campus/Other' in city_counts:
+        other_val = city_counts.pop('Multi-campus/Other')
+        city_counts['Multi-campus/Other'] = other_val
+    wedges, texts, autotexts = axes[2].pie(
+        city_counts.values, labels=city_counts.index, autopct='%1.1f%%',
+        colors=PALETTE[:len(city_counts)],
+        startangle=140, pctdistance=0.8, textprops={'fontsize': 10}
+    )
+    for at in autotexts:
+        at.set_fontweight('bold')
+    axes[2].set_title('🏙️ City Distribution')
+else:
+    axes[2].axis('off')
 
 fig.tight_layout()
 plt.show()"""))
@@ -468,7 +552,7 @@ else:
     ax_sub.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=16)
     ax_sub.set_title('📝 Submission Rate', fontsize=14)
 
-# ── Top Institutions (bottom-left) ────────────────────────────
+# ── Top Institutions (bottom-left, member-level) ─────────────
 ax_inst = fig.add_subplot(gs[2, 0:2])
 top8 = inst_counts.head(8)
 bars = ax_inst.barh(range(len(top8)), top8.values[::-1],
@@ -477,8 +561,8 @@ bars = ax_inst.barh(range(len(top8)), top8.values[::-1],
 ax_inst.set_yticks(range(len(top8)))
 trunc_labels = [str(n)[:30] + '...' if len(str(n)) > 30 else str(n) for n in top8.index[::-1]]
 ax_inst.set_yticklabels(trunc_labels, fontsize=9)
-ax_inst.set_xlabel('Teams')
-ax_inst.set_title('🏫 Top Institutions', fontsize=14)
+ax_inst.set_xlabel('Participants')
+ax_inst.set_title('🏫 Top Institutions (by participants)', fontsize=14)
 for bar, val in zip(bars, top8.values[::-1]):
     ax_inst.text(val + 0.1, bar.get_y() + bar.get_height()/2,
                  str(val), va='center', fontsize=9, fontweight='bold')
@@ -510,7 +594,7 @@ cells.append(nbf.v4.new_markdown_cell("""---
 
 nb.cells = cells
 
-with open(r'C:\Users\jimmy\Documents\Tài liệu\vital docs\CODING\Python\Lean_AI\Project\datathon.ipynb', 'w', encoding='utf-8') as f:
+with open('datathon.ipynb', 'w', encoding='utf-8') as f:
     nbf.write(nb, f)
 
 print("✅ datathon.ipynb created successfully!")

@@ -1,2 +1,31 @@
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+
+# Ignore virtual environment
+venv/
+.venv/
+env/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore data files (optional - uncomment if you don't want to track data)
 data.csv
 data2.csv
+TOMPEI-CMMD/
+
+# Ignore generated outputs (optional - uncomment if you don't want to track outputs)
+# datathon.ipynb
+# datathon_dashboard.png
+generate_notebook.py
